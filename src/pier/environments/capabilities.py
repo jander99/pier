@@ -15,6 +15,12 @@ class EnvironmentCapabilities(BaseModel):
     disable_internet: bool = False
     """Whether the environment can run containers without internet access."""
 
+    filtered_egress: bool = False
+    """Whether the environment can allow only declared outbound inference hosts."""
+
+    preinstall_agents: bool = False
+    """Whether the environment can install selected agents at image build time."""
+
     windows: bool = False
     """Whether the environment can run Windows containers."""
 

@@ -4,6 +4,7 @@ import asyncio
 import os
 import re
 import shlex
+import socket
 from abc import abstractmethod
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -11,6 +12,14 @@ from uuid import uuid4
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from pier.environments.agent_setup import (
+    EGRESS_PROXY_PORT,
+    dockerfile_install_commands,
+    new_proxy_token,
+    proxy_environment,
+    proxy_policy_env,
+    squid_bootstrap_command,
+)
 from pier.environments.base import BaseEnvironment, ExecResult
 from pier.environments.capabilities import EnvironmentCapabilities
 from pier.environments.docker import (
@@ -27,6 +36,7 @@ from pier.utils.env import resolve_env_vars
 from pier.utils.optional_import import MissingExtraError
 
 try:
+    import modal
     from modal import App, Image, Sandbox, Secret, Volume
 
     _HAS_MODAL = True
@@ -119,6 +129,7 @@ class _ModalStrategy:
             env._sandbox = None
             env._app = None
             env._image = None
+            await env._teardown_egress_proxy()
 
     async def exec_on_vm(
         self,
@@ -165,12 +176,14 @@ class _ModalDirect(_ModalStrategy):
                 env._environment_definition_path,
                 context_dir=env.environment_dir,
             )
+        env._image = env._with_agent_install(env._image)
 
         env._app = await App.lookup.aio(
             name=env._app_name,
             create_if_missing=True,
         )
 
+        await env._ensure_egress_proxy()
         env._sandbox = await env._create_sandbox()
 
         await env._sandbox.mkdir.aio(str(EnvironmentPaths.agent_dir), parents=True)
@@ -808,6 +821,8 @@ class ModalEnvironment(BaseEnvironment):
         self._capabilities = EnvironmentCapabilities(
             gpus=True,
             disable_internet=not self._compose_mode,
+            filtered_egress=not self._compose_mode,
+            preinstall_agents=not self._compose_mode,
         )
         self._kwargs = kwargs
         if not _HAS_MODAL:
@@ -824,6 +839,9 @@ class ModalEnvironment(BaseEnvironment):
         self._image: Image | None = None
         self._app: App | None = None
         self._sandbox: Sandbox | None = None
+        self._egress_proxy_sandbox: Sandbox | None = None
+        self._egress_proxy_env: dict[str, str] = {}
+        self._egress_cidr_allowlist: list[str] | None = None
         self._secrets = secrets or []
         self._registry_secret = registry_secret
         self._volumes = volumes or {}
@@ -891,6 +909,8 @@ class ModalEnvironment(BaseEnvironment):
             secrets.append(
                 Secret.from_dict(dict[str, str | None](self._persistent_env))
             )
+        if self._egress_proxy_env:
+            secrets.append(Secret.from_dict(self._egress_proxy_env))
         return secrets
 
     def _volumes_config(self) -> dict[str, Volume]:
@@ -898,6 +918,77 @@ class ModalEnvironment(BaseEnvironment):
             mount_path: Volume.from_name(volume_name)
             for mount_path, volume_name in self._volumes.items()
         }
+
+    def _with_agent_install(self, image: Image) -> Image:
+        install = self.agent_install_spec
+        if install is None:
+            return image
+        commands = dockerfile_install_commands(
+            install,
+            user=self._resolve_user(None),
+        )
+        return image.dockerfile_commands(*commands)
+
+    @staticmethod
+    def _resolve_ipv4(host: str) -> str:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+        return infos[0][4][0]
+
+    async def _ensure_egress_proxy(self) -> None:
+        allowlist = self.network_allowlist
+        if self.task_env_config.allow_internet or not allowlist.domains:
+            return
+        if self._compose_mode:
+            raise ValueError(
+                "Filtered inference egress is not supported for Modal docker-compose tasks."
+            )
+        if self._egress_proxy_sandbox is not None:
+            return
+
+        token = new_proxy_token()
+        proxy_image = Image.debian_slim(python_version="3.12").apt_install(
+            "apache2-utils",
+            "ca-certificates",
+            "squid",
+        )
+        self._egress_proxy_sandbox = await Sandbox.create.aio(
+            "sh",
+            "-c",
+            squid_bootstrap_command(),
+            app=self._app,
+            image=proxy_image,
+            env=proxy_policy_env(allowlist, token),
+            unencrypted_ports=[EGRESS_PROXY_PORT],
+            readiness_probe=modal.sandbox.Probe.with_tcp(EGRESS_PROXY_PORT),
+            timeout=self._sandbox_timeout,
+            idle_timeout=self._sandbox_idle_timeout,
+            name=f"{self.session_id}-egress-proxy",
+        )
+        tunnel = (await self._egress_proxy_sandbox.tunnels.aio(timeout=60))[
+            EGRESS_PROXY_PORT
+        ]
+        if tunnel.unencrypted_host and tunnel.unencrypted_port:
+            proxy_host = tunnel.unencrypted_host
+            proxy_port = tunnel.unencrypted_port
+        else:
+            proxy_host = tunnel.host
+            proxy_port = tunnel.port
+        proxy_ip = self._resolve_ipv4(proxy_host)
+        self._egress_cidr_allowlist = [f"{proxy_ip}/32"]
+        self._egress_proxy_env = proxy_environment(token, proxy_host, proxy_port)
+
+    async def _teardown_egress_proxy(self) -> None:
+        if self._egress_proxy_sandbox is None:
+            return
+        try:
+            await self._egress_proxy_sandbox.terminate.aio()
+            await self._egress_proxy_sandbox.wait.aio(raise_on_termination=False)
+        except Exception as e:
+            self.logger.warning(f"Error terminating Modal egress proxy sandbox: {e}")
+        finally:
+            self._egress_proxy_sandbox = None
+            self._egress_proxy_env = {}
+            self._egress_cidr_allowlist = None
 
     @retry(
         stop=stop_after_attempt(2),
@@ -908,11 +999,15 @@ class ModalEnvironment(BaseEnvironment):
         self,
         *,
         block_network: bool | None = None,
+        cidr_allowlist: list[str] | None = None,
         experimental_options: dict[str, Any] | None = None,
     ) -> Sandbox:
         """Create a sandbox with retry logic for transient failures."""
         if block_network is None:
-            block_network = not self.task_env_config.allow_internet
+            block_network = (
+                not self.task_env_config.allow_internet
+                and not self._egress_cidr_allowlist
+            )
 
         kwargs: dict[str, Any] = {}
         if experimental_options:
@@ -928,6 +1023,7 @@ class ModalEnvironment(BaseEnvironment):
             memory=self.task_env_config.memory_mb,
             gpu=self._gpu_config(),
             block_network=block_network,
+            cidr_allowlist=cidr_allowlist or self._egress_cidr_allowlist,
             secrets=self._secrets_config(),
             volumes=self._volumes_config(),  # type: ignore[arg-type]
             **kwargs,

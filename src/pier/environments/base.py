@@ -10,6 +10,8 @@ from pathlib import Path, PurePath
 from pydantic import BaseModel
 
 from pier.environments.capabilities import EnvironmentCapabilities
+from pier.models.agent.install import AgentInstallSpec
+from pier.models.agent.network import NetworkAllowlist
 from pier.models.task.config import EnvironmentConfig, HealthcheckConfig, TaskOS
 from pier.models.trial.paths import EnvironmentPaths, TrialPaths
 from pier.utils.env import resolve_env_vars
@@ -60,6 +62,9 @@ class BaseEnvironment(ABC):
         override_gpus: int | None = None,
         suppress_override_warnings: bool = False,
         persistent_env: dict[str, str] | None = None,
+        agent_install_spec: AgentInstallSpec | None = None,
+        network_allowlist: NetworkAllowlist | None = None,
+        default_user: str | int | None = None,
         *args,
         **kwargs,
     ):
@@ -80,7 +85,7 @@ class BaseEnvironment(ABC):
         self.environment_name = environment_name
         self.session_id = session_id
         self.trial_paths = trial_paths
-        self.default_user = None
+        self.default_user = default_user
 
         self.task_env_config = task_env_config
 
@@ -90,6 +95,8 @@ class BaseEnvironment(ABC):
         self._override_gpus = override_gpus
         self._suppress_override_warnings = suppress_override_warnings
         self._persistent_env: dict[str, str] = persistent_env or {}
+        self.agent_install_spec = agent_install_spec
+        self.network_allowlist = network_allowlist or NetworkAllowlist()
 
         self.logger = (logger or global_logger).getChild(__name__)
 
@@ -99,6 +106,7 @@ class BaseEnvironment(ABC):
         self._validate_definition()
         self._validate_gpu_support()
         self._validate_internet_config()
+        self._validate_agent_setup_options()
         self._validate_windows_support()
 
     @property
@@ -314,6 +322,24 @@ class BaseEnvironment(ABC):
         ):
             raise ValueError(
                 f"allow_internet=False is not supported by {self.type()} environment."
+            )
+
+    def _validate_agent_setup_options(self):
+        if (
+            self.agent_install_spec is not None
+            and not self.capabilities.preinstall_agents
+        ):
+            raise ValueError(
+                f"Agent preinstall is not supported by {self.type()} environment."
+            )
+
+        if (
+            not self.task_env_config.allow_internet
+            and self.network_allowlist.domains
+            and not self.capabilities.filtered_egress
+        ):
+            raise ValueError(
+                f"Filtered inference egress is not supported by {self.type()} environment."
             )
 
     def _validate_windows_support(self):

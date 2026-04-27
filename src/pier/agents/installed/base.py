@@ -388,12 +388,17 @@ class BaseInstalledAgent(BaseAgent, ABC):
         setup_dir = self.logs_dir / "setup"
         setup_dir.mkdir(parents=True, exist_ok=True)
 
-        try:
-            await self.install(environment)
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            raise RuntimeError(f"Agent install failed: {exc}") from exc
+        install_spec = environment.agent_install_spec
+        is_preinstalled = (
+            install_spec is not None and install_spec.agent_name == self.name()
+        )
+        if not is_preinstalled:
+            try:
+                await self.install(environment)
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(f"Agent install failed: {exc}") from exc
 
         if self._version is None:
             version_cmd = self.get_version_command()

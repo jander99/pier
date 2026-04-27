@@ -4,6 +4,8 @@ from pathlib import Path
 
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.context import AgentContext
+from pier.models.agent.install import AgentInstallSpec
+from pier.models.agent.network import NetworkAllowlist
 from pier.models.task.config import MCPServerConfig
 from pier.models.trial.result import AgentInfo, ModelInfo
 from pier.utils.logger import logger as global_logger
@@ -76,6 +78,14 @@ class BaseAgent(ABC):
             ),
         )
 
+    def install_spec(self) -> AgentInstallSpec | None:
+        """Return build-time install commands for this resolved agent, if any."""
+        return None
+
+    def network_allowlist(self) -> NetworkAllowlist:
+        """Return network domains this agent may need at runtime."""
+        return NetworkAllowlist()
+
     @staticmethod
     @abstractmethod
     def name() -> str:
@@ -101,8 +111,8 @@ class BaseAgent(ABC):
         the agent (e.g. by creating a .mcp.json file) and copy skills from
         ``self.skills_dir`` to the agent's expected location.
 
-        The user the agent should run as is set on ``environment.default_user`` by
-        the orchestrator before this method is called.
+        The user the agent should run as is available on
+        ``environment.default_user``.
 
         Args:
             environment: The environment in which to setup the agent.
@@ -124,10 +134,10 @@ class BaseAgent(ABC):
         the agent (e.g. by creating a .mcp.json file) and copy skills from
         ``self.skills_dir`` to the agent's expected location.
 
-        The user the agent should run as is set on ``environment.default_user`` by
-        the orchestrator before this method is called.  Any call to
-        ``environment.exec`` that does not pass an explicit ``user`` argument will
-        automatically run as that user.
+        The user the agent should run as is available on
+        ``environment.default_user``. Any call to ``environment.exec`` that does
+        not pass an explicit ``user`` argument will automatically run as that
+        user.
 
         Args:
             instruction: The task instruction.

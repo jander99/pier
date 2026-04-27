@@ -11,6 +11,11 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+from pier.environments.agent_setup import (
+    new_proxy_token,
+    write_agent_dockerfile,
+    write_docker_proxy_compose,
+)
 from pier.environments.base import BaseEnvironment, ExecResult
 from pier.environments.capabilities import EnvironmentCapabilities
 from pier.environments.docker import (
@@ -172,6 +177,8 @@ class DockerEnvironment(BaseEnvironment):
         )
         self._mounts_json = mounts_json
         self._mounts_compose_path: Path | None = None
+        self._agent_build_context_dir: Path | None = None
+        self._egress_proxy_compose_path: Path | None = None
 
         # Select the platform-specific file-transfer and exec helpers.
         if self._is_windows_container:
@@ -187,8 +194,15 @@ class DockerEnvironment(BaseEnvironment):
             self._windows_container_name: str | None = None
             self._platform = UnixOps(self)
 
+        install_fingerprint = (
+            f"__agent-{self.agent_install_spec.fingerprint()}"
+            if self.agent_install_spec
+            else ""
+        )
         self._env_vars = DockerEnvironmentEnvVars(
-            main_image_name=_sanitize_docker_image_name(f"hb__{environment_name}"),
+            main_image_name=_sanitize_docker_image_name(
+                f"hb__{environment_name}{install_fingerprint}"
+            ),
             context_dir=str(self.environment_dir.resolve().absolute()),
             host_verifier_logs_path=trial_paths.verifier_dir.resolve()
             .absolute()
@@ -238,6 +252,8 @@ class DockerEnvironment(BaseEnvironment):
     def capabilities(self) -> EnvironmentCapabilities:
         return EnvironmentCapabilities(
             disable_internet=True,
+            filtered_egress=True,
+            preinstall_agents=True,
             windows=True,
             mounted=True,
         )
@@ -295,10 +311,62 @@ class DockerEnvironment(BaseEnvironment):
         if self._mounts_compose_path:
             paths.append(self._mounts_compose_path)
 
-        if not self.task_env_config.allow_internet:
+        if self._egress_proxy_compose_path:
+            paths.append(self._egress_proxy_compose_path)
+        elif not self.task_env_config.allow_internet:
             paths.append(self._DOCKER_COMPOSE_NO_NETWORK_PATH)
 
         return paths
+
+    def _prepare_agent_build_context(self) -> None:
+        install = self.agent_install_spec
+        if install is None:
+            return
+        if self._uses_compose:
+            raise ValueError(
+                "Agent build-time install is currently supported only for Dockerfile "
+                "or prebuilt-image tasks, not docker-compose tasks."
+            )
+        if self._is_windows_container:
+            raise ValueError(
+                "Agent build-time install is not supported for Windows tasks."
+            )
+
+        build_dir = self.trial_paths.trial_dir / "agent-build-context"
+        if build_dir.exists():
+            shutil.rmtree(build_dir)
+
+        if self.task_env_config.docker_image:
+            build_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            shutil.copytree(self.environment_dir, build_dir)
+
+        write_agent_dockerfile(
+            build_dir=build_dir,
+            source_environment_dir=build_dir,
+            prebuilt_image_name=self.task_env_config.docker_image,
+            install=install,
+            user=self._resolve_user(None),
+        )
+        self._agent_build_context_dir = build_dir
+        self._env_vars.context_dir = str(build_dir.resolve().absolute())
+
+    def _prepare_egress_proxy_compose(self) -> None:
+        allowlist = self.network_allowlist
+        if self.task_env_config.allow_internet or not allowlist.domains:
+            return
+        if self._uses_compose:
+            raise ValueError(
+                "Filtered inference egress is currently supported only for Dockerfile "
+                "or prebuilt-image tasks, not docker-compose tasks."
+            )
+        token = new_proxy_token()
+        self._egress_proxy_compose_path = write_docker_proxy_compose(
+            path=self.trial_paths.trial_dir / "docker-compose-egress-proxy.json",
+            proxy_dir=self.trial_paths.trial_dir / "egress-proxy",
+            allowlist=allowlist,
+            token=token,
+        )
 
     def _write_mounts_compose_file(self) -> Path:
         """Write a docker-compose override file with additional volume mounts."""
@@ -460,10 +528,17 @@ class DockerEnvironment(BaseEnvironment):
             )
 
     async def start(self, force_build: bool):
+        self._prepare_agent_build_context()
+        self._prepare_egress_proxy_compose()
+
         if self._mounts_json:
             self._mounts_compose_path = self._write_mounts_compose_file()
 
-        self._use_prebuilt = not force_build and self.task_env_config.docker_image
+        self._use_prebuilt = (
+            not force_build
+            and self.task_env_config.docker_image
+            and self.agent_install_spec is None
+        )
 
         # Fail fast if the daemon mode disagrees with the task's declared OS.
         self._validate_daemon_mode()

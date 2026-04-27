@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import NamedTuple
 
 from pier.environments.base import BaseEnvironment
+from pier.models.agent.install import AgentInstallSpec
+from pier.models.agent.network import NetworkAllowlist
 from pier.models.environment_type import EnvironmentType
 from pier.models.task.config import EnvironmentConfig
 from pier.models.trial.config import EnvironmentConfig as TrialEnvironmentConfig
@@ -73,6 +75,9 @@ class EnvironmentFactory:
         trial_paths: TrialPaths,
         task_env_config: EnvironmentConfig,
         logger: logging.Logger | None = None,
+        agent_install_spec: AgentInstallSpec | None = None,
+        network_allowlist: NetworkAllowlist | None = None,
+        default_user: str | int | None = None,
         **kwargs,
     ) -> BaseEnvironment:
         environment_class = _load_environment_class(type)
@@ -84,6 +89,9 @@ class EnvironmentFactory:
             trial_paths=trial_paths,
             task_env_config=task_env_config,
             logger=logger,
+            agent_install_spec=agent_install_spec,
+            network_allowlist=network_allowlist,
+            default_user=default_user,
             **kwargs,
         )
 
@@ -123,6 +131,9 @@ class EnvironmentFactory:
         trial_paths: TrialPaths,
         task_env_config: EnvironmentConfig,
         logger: logging.Logger | None = None,
+        agent_install_spec: AgentInstallSpec | None = None,
+        network_allowlist: NetworkAllowlist | None = None,
+        default_user: str | int | None = None,
         **kwargs,
     ) -> BaseEnvironment:
         """
@@ -162,6 +173,9 @@ class EnvironmentFactory:
             trial_paths=trial_paths,
             task_env_config=task_env_config,
             logger=logger,
+            agent_install_spec=agent_install_spec,
+            network_allowlist=network_allowlist,
+            default_user=default_user,
             **kwargs,
         )
 
@@ -175,6 +189,9 @@ class EnvironmentFactory:
         trial_paths: TrialPaths,
         task_env_config: EnvironmentConfig,
         logger: logging.Logger | None = None,
+        agent_install_spec: AgentInstallSpec | None = None,
+        network_allowlist: NetworkAllowlist | None = None,
+        default_user: str | int | None = None,
         **kwargs,
     ) -> BaseEnvironment:
         """
@@ -210,6 +227,9 @@ class EnvironmentFactory:
                 trial_paths=trial_paths,
                 task_env_config=task_env_config,
                 logger=logger,
+                agent_install_spec=agent_install_spec,
+                network_allowlist=network_allowlist,
+                default_user=default_user,
                 **env_constructor_kwargs,
             )
         elif config.type is not None:
@@ -221,6 +241,9 @@ class EnvironmentFactory:
                 trial_paths=trial_paths,
                 task_env_config=task_env_config,
                 logger=logger,
+                agent_install_spec=agent_install_spec,
+                network_allowlist=network_allowlist,
+                default_user=default_user,
                 **env_constructor_kwargs,
             )
         else:
