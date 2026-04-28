@@ -19,6 +19,9 @@ More is planned from here, and pier will keep drifting from Harbor as we go.
 - **Task format:** Harbor-compatible.
 - **Environments:** `docker`, `modal`.
 - **Agents:** `nop`, `oracle`, `claude-code`, `codex`, `gemini-cli`, `opencode`, `mini-swe-agent`.
+- **Datasets:** local Harbor-format task directories via `-p` / `--path`.
+
+Pier does not currently resolve or download Harbor registry datasets directly. Use Harbor to export a dataset first, then point Pier at the local directory.
 
 If your tasks allow internet, or your agent runs outside the sandbox, Harbor is the broader, more mature choice and you should probably use it.
 
@@ -35,6 +38,31 @@ pip install pier
 ```bash
 export ANTHROPIC_API_KEY=...
 pier run -p path/to/task --agent claude-code --env modal --env-file .env
+```
+
+Run a local dataset:
+
+```bash
+pier run -p path/to/dataset --agent claude-code --env modal
+```
+
+Run a deterministic random subset of a local dataset:
+
+```bash
+pier run -p path/to/dataset --n-tasks 10 --sample-seed 0
+```
+
+To use a Harbor registry dataset, download it with Harbor first. For example, from `~/code/harbor`:
+
+```bash
+uv run harbor download swebenchpro -o ~/code/pier/datasets
+```
+
+Then run it with Pier:
+
+```bash
+cd ~/code/pier
+uv run pier run -p datasets/swebenchpro --n-tasks 10 --sample-seed 0
 ```
 
 See `pier run --help` and `pier job --help` for everything else. Trials land under `jobs/<timestamp>/<trial_id>/`.
