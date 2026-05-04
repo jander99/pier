@@ -14,10 +14,11 @@ from pier.agents.installed.base import (
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.context import AgentContext
 from pier.models.agent.install import AgentInstallSpec, InstallStep
-from pier.models.agent.network import NetworkAllowlist
 from pier.models.agent.name import AgentName
+from pier.models.agent.network import NetworkAllowlist
 from pier.models.trajectories import (
     Agent,
+    ContentPart,
     FinalMetrics,
     Metrics,
     Observation,
@@ -27,6 +28,11 @@ from pier.models.trajectories import (
     Trajectory,
 )
 from pier.models.trial.paths import EnvironmentPaths
+from pier.utils.trajectory_metrics import (
+    extra_with_context_metrics,
+    peak_context_tokens_from_steps,
+    populate_context_from_final_metrics,
+)
 
 
 class ClaudeCode(BaseInstalledAgent):
@@ -248,6 +254,7 @@ class ClaudeCode(BaseInstalledAgent):
                 timestamp=timestamp,
                 source=source,
                 message=text,
+                llm_call_count=1 if source == "agent" else None,
             )
 
             if source == "agent":
@@ -322,6 +329,7 @@ class ClaudeCode(BaseInstalledAgent):
                 message=message,
                 tool_calls=[tool_call],
                 observation=observation,
+                llm_call_count=1,
             )
 
             if model_name:
@@ -332,6 +340,61 @@ class ClaudeCode(BaseInstalledAgent):
                 step.metrics = metrics
             if extra:
                 step.extra = extra
+
+            return step
+
+        if kind == "bundled":
+            raw_message = event.get("message", "")
+            reasoning = event.get("reasoning")
+            metrics = event.get("metrics")
+            extra = event.get("extra")
+            model_name = event.get("model_name") or self.model_name
+            message: str | list[ContentPart]
+            if isinstance(raw_message, str):
+                message = raw_message
+            elif isinstance(raw_message, list):
+                message = raw_message
+            else:
+                message = self._stringify(raw_message)
+
+            tool_calls: list[ToolCall] = []
+            observation_results: list[ObservationResult] = []
+            for tc in event.get("tool_calls", []):
+                call_id = tc.get("call_id", "")
+                tool_calls.append(
+                    ToolCall(
+                        tool_call_id=call_id,
+                        function_name=tc.get("tool_name", ""),
+                        arguments=tc.get("arguments") or {},
+                    )
+                )
+                observation_results.append(
+                    ObservationResult(
+                        source_call_id=call_id,
+                        content=tc.get("output"),
+                        subagent_trajectory_ref=None,
+                    )
+                )
+
+            step = Step(
+                step_id=step_id,
+                timestamp=timestamp,
+                source="agent",
+                message=message,
+                llm_call_count=1,
+            )
+            if model_name:
+                step.model_name = model_name
+            if reasoning:
+                step.reasoning_content = reasoning
+            if metrics:
+                step.metrics = metrics
+            if extra:
+                step.extra = extra
+            if tool_calls:
+                step.tool_calls = tool_calls
+            if observation_results:
+                step.observation = Observation(results=observation_results)
 
             return step
 
@@ -508,6 +571,101 @@ class ClaudeCode(BaseInstalledAgent):
 
         result_text = "\n\n".join(part for part in parts if part).strip()
         return (result_text or None), metadata
+
+    @staticmethod
+    def _group_events_by_msg_id(
+        normalized_events: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Merge assistant message fragments sharing a Claude message id."""
+        result: list[dict[str, Any]] = []
+        groups: dict[str, dict[str, Any]] = {}
+        group_order: list[str] = []
+
+        def flush() -> None:
+            for group_id in group_order:
+                group = groups.pop(group_id, None)
+                if group is None:
+                    continue
+                group["tool_calls"].sort(key=lambda tc: tc.get("tool_order", 0))
+                message_parts = [
+                    part.strip()
+                    for part in group.pop("message_parts")
+                    if isinstance(part, str) and part.strip()
+                ]
+                reasoning_parts = [
+                    part.strip()
+                    for part in group.pop("reasoning_parts")
+                    if isinstance(part, str) and part.strip()
+                ]
+                if len(message_parts) == 0:
+                    group["message"] = ""
+                elif len(message_parts) == 1:
+                    group["message"] = message_parts[0]
+                else:
+                    group["message"] = [
+                        ContentPart(type="text", text=part) for part in message_parts
+                    ]
+                if reasoning_parts:
+                    group["reasoning"] = "\n\n".join(reasoning_parts)
+                result.append(group)
+            group_order.clear()
+
+        for event in normalized_events:
+            msg_id = event.get("msg_id")
+            if not msg_id:
+                flush()
+                result.append(event)
+                continue
+
+            if msg_id not in groups:
+                groups[msg_id] = {
+                    "kind": "bundled",
+                    "msg_id": msg_id,
+                    "timestamp": event.get("timestamp"),
+                    "reasoning": None,
+                    "metrics": None,
+                    "extra": None,
+                    "model_name": event.get("model_name"),
+                    "message_parts": [],
+                    "reasoning_parts": [],
+                    "tool_calls": [],
+                }
+                group_order.append(msg_id)
+
+            group = groups[msg_id]
+            if event.get("kind") == "message":
+                text = event.get("text")
+                if isinstance(text, str) and text:
+                    group["message_parts"].append(text)
+                reasoning = event.get("reasoning")
+                if isinstance(reasoning, str) and reasoning:
+                    group["reasoning_parts"].append(reasoning)
+                if not group.get("metrics") and event.get("metrics"):
+                    group["metrics"] = event["metrics"]
+                extra = event.get("extra")
+                if isinstance(extra, dict) and extra:
+                    existing_extra = group.get("extra")
+                    merged_extra = (
+                        dict(existing_extra) if isinstance(existing_extra, dict) else {}
+                    )
+                    merged_extra.update(extra)
+                    group["extra"] = merged_extra
+                if not group.get("model_name") and event.get("model_name"):
+                    group["model_name"] = event["model_name"]
+                if not group.get("timestamp") and event.get("timestamp"):
+                    group["timestamp"] = event["timestamp"]
+            elif event.get("kind") == "tool_call":
+                group["tool_calls"].append(event)
+                reasoning = event.get("reasoning")
+                if isinstance(reasoning, str) and reasoning:
+                    group["reasoning_parts"].append(reasoning)
+                if not group["metrics"] and event.get("metrics"):
+                    group["metrics"] = event["metrics"]
+                if not group.get("model_name") and event.get("model_name"):
+                    group["model_name"] = event["model_name"]
+
+        flush()
+        return result
 
     def _parse_total_cost_from_stream_json(self) -> float | None:
         """Extract authoritative `total_cost_usd` from Claude Code's stdout stream.
@@ -688,6 +846,7 @@ class ClaudeCode(BaseInstalledAgent):
                     normalized_events.append(
                         {
                             "kind": "message",
+                            "msg_id": msg_id,
                             "timestamp": timestamp,
                             "role": message.get("role", "assistant"),
                             "text": text or "",
@@ -720,6 +879,8 @@ class ClaudeCode(BaseInstalledAgent):
 
                     pending_calls[call_id] = {
                         "kind": "tool_call",
+                        "msg_id": msg_id,
+                        "tool_order": idx,
                         "timestamp": timestamp,
                         "call_id": call_id,
                         "tool_name": tool_block.get("name") or "",
@@ -842,8 +1003,10 @@ class ClaudeCode(BaseInstalledAgent):
         for leftover_call in pending_calls.values():
             normalized_events.append(leftover_call)
 
+        grouped_events = self._group_events_by_msg_id(normalized_events)
+
         steps: list[Step] = []
-        for idx, norm_event in enumerate(normalized_events, start=1):
+        for idx, norm_event in enumerate(grouped_events, start=1):
             try:
                 step = self._convert_event_to_step(norm_event, idx)
             except ValueError as exc:
@@ -898,6 +1061,14 @@ class ClaudeCode(BaseInstalledAgent):
                 cache_read_total += cache_read
                 cache_read_seen = True
 
+        summarization_count = sum(
+            1
+            for event in events
+            if event.get("type") == "system"
+            and isinstance(event.get("message"), dict)
+            and event["message"].get("subtype") == "compact_boundary"
+        )
+
         final_extra: dict[str, Any] | None = {}
         if service_tiers:
             final_extra["service_tiers"] = sorted(service_tiers)
@@ -905,8 +1076,15 @@ class ClaudeCode(BaseInstalledAgent):
             final_extra["total_cache_creation_input_tokens"] = cache_creation_total
         if cache_read_seen:
             final_extra["total_cache_read_input_tokens"] = cache_read_total
+        if summarization_count:
+            final_extra["compacted"] = True
         if not final_extra:
             final_extra = None
+        final_extra = extra_with_context_metrics(
+            final_extra,
+            peak_context_tokens=peak_context_tokens_from_steps(steps),
+            summarization_count=summarization_count,
+        )
 
         final_metrics = FinalMetrics(
             total_prompt_tokens=total_prompt_tokens,
@@ -918,7 +1096,7 @@ class ClaudeCode(BaseInstalledAgent):
         )
 
         trajectory = Trajectory(
-            schema_version="ATIF-v1.2",
+            schema_version="ATIF-v1.7",
             session_id=session_id,
             agent=Agent(
                 name=AgentName.CLAUDE_CODE.value,
@@ -962,11 +1140,7 @@ class ClaudeCode(BaseInstalledAgent):
             )
 
         if trajectory.final_metrics:
-            metrics = trajectory.final_metrics
-            context.cost_usd = metrics.total_cost_usd
-            context.n_input_tokens = metrics.total_prompt_tokens or 0
-            context.n_cache_tokens = metrics.total_cached_tokens or 0
-            context.n_output_tokens = metrics.total_completion_tokens or 0
+            populate_context_from_final_metrics(context, trajectory.final_metrics)
 
     def _build_register_skills_command(self) -> str | None:
         """Return a shell command that copies skills from the environment to Claude's config.

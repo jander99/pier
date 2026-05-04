@@ -30,6 +30,11 @@ from pier.models.trajectories import (
     Trajectory,
 )
 from pier.models.trial.paths import EnvironmentPaths
+from pier.utils.trajectory_metrics import (
+    extra_with_context_metrics,
+    peak_context_tokens_from_steps,
+    populate_context_from_final_metrics,
+)
 from pier.utils.logger import logger
 
 
@@ -254,6 +259,7 @@ def convert_mini_swe_agent_to_atif(
                     reasoning_content=reasoning,
                     tool_calls=tool_calls,
                     metrics=metrics,
+                    llm_call_count=1,
                 )
             )
             step_id += 1
@@ -262,13 +268,19 @@ def convert_mini_swe_agent_to_atif(
     final_extra: dict[str, Any] = {}
     if total_reasoning_tokens > 0:
         final_extra["total_reasoning_tokens"] = total_reasoning_tokens
+    final_extra = extra_with_context_metrics(
+        final_extra if final_extra else None,
+        peak_context_tokens=peak_context_tokens_from_steps(steps),
+        summarization_count=None,
+    )
 
     final_metrics = FinalMetrics(
         total_prompt_tokens=total_prompt_tokens,
         total_completion_tokens=total_completion_tokens,
         total_cached_tokens=total_cached_tokens if total_cached_tokens > 0 else None,
         total_cost_usd=total_cost_usd if total_cost_usd > 0 else None,
-        extra=final_extra if final_extra else None,
+        total_steps=len(steps),
+        extra=final_extra,
     )
 
     agent = Agent(
@@ -282,7 +294,7 @@ def convert_mini_swe_agent_to_atif(
     )
 
     return Trajectory(
-        schema_version="ATIF-v1.2",
+        schema_version="ATIF-v1.7",
         session_id=session_id,
         agent=agent,
         steps=steps,
@@ -295,7 +307,7 @@ def convert_and_save_trajectory(
     mini_swe_agent_trajectory_path: Path,
     atif_trajectory_path: Path,
     session_id: str,
-) -> None:
+) -> Trajectory:
     """
     Convert mini-swe-agent trajectory file to ATIF format and save it.
 
@@ -323,6 +335,7 @@ def convert_and_save_trajectory(
         _logger.info(
             f"Successfully converted trajectory to ATIF format: {atif_trajectory_path}"
         )
+        return atif_trajectory
 
     except Exception as e:
         _logger.error(f"Failed to convert trajectory: {e}")
@@ -544,11 +557,15 @@ mini-swe-agent --help
         atif_trajectory_path = self.logs_dir / "trajectory.json"
         session_id = str(uuid.uuid4())
         try:
-            convert_and_save_trajectory(
+            atif_trajectory = convert_and_save_trajectory(
                 mini_swe_agent_trajectory_path=mini_trajectory_path,
                 atif_trajectory_path=atif_trajectory_path,
                 session_id=session_id,
             )
+            if atif_trajectory.final_metrics:
+                populate_context_from_final_metrics(
+                    context, atif_trajectory.final_metrics
+                )
         except Exception as e:
             self.logger.debug(f"Failed to convert trajectory to ATIF format: {e}")
 

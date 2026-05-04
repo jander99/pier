@@ -25,6 +25,11 @@ from pier.models.trajectories import (
     ToolCall,
     Trajectory,
 )
+from pier.utils.trajectory_metrics import (
+    extra_with_context_metrics,
+    peak_context_tokens_from_steps,
+    populate_context_from_final_metrics,
+)
 from pier.utils.trajectory_utils import format_trajectory_json
 
 
@@ -293,6 +298,7 @@ class OpenCode(BaseInstalledAgent):
                 "source": "agent",
                 "message": message_text or "(tool use)",
                 "model_name": self.model_name,
+                "llm_call_count": 1,
             }
             if reasoning_parts:
                 step_kwargs["reasoning_content"] = "\n\n".join(reasoning_parts)
@@ -315,10 +321,15 @@ class OpenCode(BaseInstalledAgent):
             total_cached_tokens=total_cache_read or None,
             total_cost_usd=total_cost if total_cost else None,
             total_steps=len(steps),
+            extra=extra_with_context_metrics(
+                None,
+                peak_context_tokens=peak_context_tokens_from_steps(steps),
+                summarization_count=None,
+            ),
         )
 
         return Trajectory(
-            schema_version="ATIF-v1.6",
+            schema_version="ATIF-v1.7",
             session_id=session_id or "unknown",
             agent=Agent(
                 name="opencode",
@@ -356,11 +367,7 @@ class OpenCode(BaseInstalledAgent):
             )
 
         if trajectory.final_metrics:
-            fm = trajectory.final_metrics
-            context.cost_usd = fm.total_cost_usd
-            context.n_input_tokens = fm.total_prompt_tokens or 0
-            context.n_output_tokens = fm.total_completion_tokens or 0
-            context.n_cache_tokens = fm.total_cached_tokens or 0
+            populate_context_from_final_metrics(context, trajectory.final_metrics)
 
     def _build_register_skills_command(self) -> str | None:
         """Return a shell command that copies skills to OpenCode's skills directory."""

@@ -788,12 +788,16 @@ function TrajectoryViewer({
     });
   };
 
+  const agentStepCount = trajectory.steps.filter(
+    (trajectoryStep) => trajectoryStep.source === "agent"
+  ).length;
+
   return (
     <Card>
       <CardHeader>
         <CardTitle>Trajectory</CardTitle>
         <div className="text-sm text-muted-foreground">
-          {trajectory.steps.length} steps
+          {agentStepCount} agent steps / {trajectory.steps.length} records
           {trajectory.final_metrics?.total_cost_usd && (
             <> / ${trajectory.final_metrics.total_cost_usd.toFixed(2)} total</>
           )}
@@ -1843,6 +1847,12 @@ function TrialContent({
     : trial.exception_info;
 
   const metrics = trajectory?.final_metrics;
+  const peakContextTokensRaw = metrics?.extra?.peak_context_tokens;
+  const peakContextTokens =
+    typeof peakContextTokensRaw === "number" ? peakContextTokensRaw : null;
+  const summarizationCountRaw = metrics?.extra?.summarization_count;
+  const summarizationCount =
+    typeof summarizationCountRaw === "number" ? summarizationCountRaw : null;
 
   return (
     <>
@@ -1932,6 +1942,20 @@ function TrialContent({
               })()}
               totalLabel={`${((metrics?.total_prompt_tokens ?? 0) + (metrics?.total_completion_tokens ?? 0)).toLocaleString()} tokens`}
             />
+            {peakContextTokens != null && (
+              <DetailRow
+                label="Peak context"
+                value={`${peakContextTokens.toLocaleString()} tokens`}
+                className="font-mono text-xs"
+              />
+            )}
+            {summarizationCount != null && (
+              <DetailRow
+                label="Summarizations"
+                value={summarizationCount.toLocaleString()}
+                className="font-mono text-xs"
+              />
+            )}
           </CardContent>
         </Card>
 

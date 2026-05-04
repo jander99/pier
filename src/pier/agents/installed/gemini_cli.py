@@ -27,6 +27,11 @@ from pier.models.trajectories import (
     ToolCall,
     Trajectory,
 )
+from pier.utils.trajectory_metrics import (
+    extra_with_context_metrics,
+    peak_context_tokens_from_steps,
+    populate_context_from_final_metrics,
+)
 
 _ImageMediaType = Literal["image/jpeg", "image/png", "image/gif", "image/webp"]
 _ReasoningEffort = Literal["minimal", "low", "medium", "high"]
@@ -201,6 +206,21 @@ class GeminiCli(BaseInstalledAgent):
 
         # Return relative path from trajectory.json location
         return f"images/{filename}", valid_type
+
+    @staticmethod
+    def _is_summarization_message(message: dict[str, Any]) -> bool:
+        """Detect Gemini CLI context compression messages."""
+        if message.get("type") not in ("compression", "chat_compressed"):
+            return False
+
+        status = message.get("compressionStatus")
+        if status is None:
+            return True
+        if isinstance(status, int):
+            return status == 1
+        if isinstance(status, str):
+            return status.lower() in {"compressed", "compression_status_compressed"}
+        return False
 
     def _convert_gemini_to_atif(
         self, gemini_trajectory: dict[str, Any]
@@ -408,12 +428,23 @@ class GeminiCli(BaseInstalledAgent):
                         tool_calls=tool_calls,
                         observation=observation,
                         metrics=metrics,
+                        llm_call_count=1,
                     )
                 )
                 step_id += 1
 
         if not steps:
             return None
+
+        summarization_count = sum(
+            1 for message in messages if self._is_summarization_message(message)
+        )
+        final_extra = {"compacted": True} if summarization_count else None
+        final_extra = extra_with_context_metrics(
+            final_extra,
+            peak_context_tokens=peak_context_tokens_from_steps(steps),
+            summarization_count=summarization_count,
+        )
 
         # Build final metrics
         final_metrics = FinalMetrics(
@@ -424,6 +455,7 @@ class GeminiCli(BaseInstalledAgent):
                 total_input_tokens, total_output_tokens, total_cached_tokens
             ),
             total_steps=len(steps),
+            extra=final_extra,
         )
 
         # Determine model name from first agent step
@@ -435,7 +467,7 @@ class GeminiCli(BaseInstalledAgent):
 
         # Build trajectory
         trajectory = Trajectory(
-            schema_version="ATIF-v1.6",
+            schema_version="ATIF-v1.7",
             session_id=session_id,
             agent=Agent(
                 name="gemini-cli",
@@ -592,6 +624,10 @@ class GeminiCli(BaseInstalledAgent):
                 atif_path = self.logs_dir / "trajectory.json"
                 with open(atif_path, "w") as f:
                     json.dump(atif_trajectory.to_json_dict(), f, indent=2)
+                if atif_trajectory.final_metrics:
+                    populate_context_from_final_metrics(
+                        context, atif_trajectory.final_metrics
+                    )
         except Exception as e:
             self.logger.debug(f"Error converting Gemini trajectory to ATIF: {e}")
 

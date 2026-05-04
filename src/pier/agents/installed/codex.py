@@ -28,7 +28,13 @@ from pier.models.trajectories import (
 )
 from pier.models.trial.paths import EnvironmentPaths
 from pier.utils.env import parse_bool_env_value
+from pier.utils.trajectory_metrics import (
+    extra_with_context_metrics,
+    populate_context_from_final_metrics,
+)
 from pier.utils.trajectory_utils import format_trajectory_json
+
+_COMPACTION_DROP_TOKEN_THRESHOLD = 10_000
 
 
 class Codex(BaseInstalledAgent):
@@ -209,6 +215,168 @@ class Codex(BaseInstalledAgent):
 
         return str(parsed), None
 
+    @staticmethod
+    def _group_events_by_api_call_id(
+        normalized_events: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Merge assistant events from the same Codex model request into one step."""
+        result: list[dict[str, Any]] = []
+        groups: dict[str, dict[str, Any]] = {}
+        group_order: list[str] = []
+
+        def flush() -> None:
+            for group_id in group_order:
+                group = groups.pop(group_id, None)
+                if group is None:
+                    continue
+                group["tool_calls"].sort(key=lambda tc: tc.get("tool_order", 0))
+                message_parts = [
+                    part
+                    for part in group.pop("message_parts")
+                    if isinstance(part, str) and part
+                ]
+                group["text"] = "\n\n".join(message_parts)
+                result.append(group)
+            group_order.clear()
+
+        for event in normalized_events:
+            api_call_id = event.get("api_call_id")
+            kind = event.get("kind")
+            role = event.get("role")
+
+            if kind == "message" and role != "assistant":
+                flush()
+                result.append(event)
+                continue
+
+            if not isinstance(api_call_id, str):
+                flush()
+                result.append(event)
+                continue
+
+            if api_call_id not in groups:
+                groups[api_call_id] = {
+                    "kind": "bundled",
+                    "api_call_id": api_call_id,
+                    "codex_turn_id": event.get("codex_turn_id"),
+                    "timestamp": event.get("timestamp"),
+                    "message_parts": [],
+                    "reasoning": None,
+                    "tool_calls": [],
+                    "metrics": event.get("metrics"),
+                }
+                group_order.append(api_call_id)
+
+            group = groups[api_call_id]
+            if kind == "message":
+                text = event.get("text")
+                if isinstance(text, str) and text:
+                    group["message_parts"].append(text)
+                if event.get("reasoning"):
+                    group["reasoning"] = event["reasoning"]
+                if event.get("timestamp"):
+                    group["timestamp"] = event["timestamp"]
+            elif kind == "tool_call":
+                group["tool_calls"].append(event)
+                if not group["reasoning"] and event.get("reasoning"):
+                    group["reasoning"] = event["reasoning"]
+                if not group.get("metrics") and event.get("metrics"):
+                    group["metrics"] = event["metrics"]
+
+        flush()
+        return result
+
+    @staticmethod
+    def _metrics_from_token_count_payload(
+        payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        info = payload.get("info")
+        if not isinstance(info, dict):
+            return None
+
+        last_usage = info.get("last_token_usage")
+        if not isinstance(last_usage, dict):
+            return None
+
+        prompt_tokens = last_usage.get("input_tokens")
+        completion_tokens = last_usage.get("output_tokens")
+        cached_tokens = last_usage.get("cached_input_tokens")
+        reasoning_tokens = last_usage.get("reasoning_output_tokens")
+        total_tokens = last_usage.get("total_tokens")
+
+        return {
+            "prompt_tokens": prompt_tokens if prompt_tokens else None,
+            "completion_tokens": completion_tokens or None,
+            "cached_tokens": cached_tokens or None,
+            "extra": {
+                "reasoning_output_tokens": reasoning_tokens,
+                "total_tokens": total_tokens,
+            },
+        }
+
+    @staticmethod
+    def _extract_context_metrics(
+        raw_events: list[dict[str, Any]],
+    ) -> tuple[int | None, int | None]:
+        """Return best-effort (peak_context_tokens, summarization_count)."""
+        peak_context_tokens: int | None = None
+        window_peak: int | None = None
+        token_drop_summarization_count = 0
+        compacted_item_count = sum(1 for event in raw_events if event.get("type") == "compacted")
+        context_compacted_event_count = 0
+        saw_usage = False
+
+        for event in raw_events:
+            if event.get("type") != "event_msg":
+                continue
+            payload = event.get("payload", {})
+            if isinstance(payload, dict) and payload.get("type") == "context_compacted":
+                context_compacted_event_count += 1
+            if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                continue
+            info = payload.get("info")
+            if not isinstance(info, dict):
+                continue
+            last_usage = info.get("last_token_usage")
+            if not isinstance(last_usage, dict):
+                continue
+
+            context_tokens = last_usage.get("total_tokens")
+            if not isinstance(context_tokens, int):
+                context_tokens = last_usage.get("input_tokens")
+            if not isinstance(context_tokens, int):
+                continue
+
+            saw_usage = True
+            peak_context_tokens = (
+                context_tokens
+                if peak_context_tokens is None
+                else max(peak_context_tokens, context_tokens)
+            )
+            if (
+                window_peak is not None
+                and context_tokens < window_peak - _COMPACTION_DROP_TOKEN_THRESHOLD
+            ):
+                token_drop_summarization_count += 1
+                window_peak = context_tokens
+            else:
+                window_peak = (
+                    context_tokens
+                    if window_peak is None
+                    else max(window_peak, context_tokens)
+                )
+
+        if not saw_usage:
+            summarization_count = compacted_item_count or context_compacted_event_count
+            return None, summarization_count if summarization_count else None
+
+        summarization_count = (
+            compacted_item_count
+            or context_compacted_event_count
+            or token_drop_summarization_count
+        )
+        return peak_context_tokens, summarization_count
+
     def _convert_event_to_step(self, event: dict[str, Any], step_id: int) -> Step:
         """Convert a normalized Codex event dictionary into an ATIF step."""
         kind = event.get("kind")
@@ -239,6 +407,7 @@ class Codex(BaseInstalledAgent):
                 model_name=self.model_name
                 if source == "agent" and self.model_name
                 else None,
+                llm_call_count=1 if source == "agent" else None,
                 extra=extra if extra else None,
             )
 
@@ -285,6 +454,14 @@ class Codex(BaseInstalledAgent):
             if status:
                 extra = extra or {}
                 extra["status"] = status
+            api_call_id = event.get("api_call_id")
+            if api_call_id:
+                extra = extra or {}
+                extra["api_call_id"] = api_call_id
+            codex_turn_id = event.get("codex_turn_id")
+            if codex_turn_id:
+                extra = extra or {}
+                extra["codex_turn_id"] = codex_turn_id
 
             message = event.get("message")
             if not message:
@@ -302,6 +479,80 @@ class Codex(BaseInstalledAgent):
                 model_name=self.model_name if self.model_name else None,
                 reasoning_content=reasoning if reasoning else None,
                 metrics=metrics,
+                llm_call_count=1,
+                extra=extra,
+            )
+
+        if kind == "bundled":
+            text = event.get("text", "")
+            reasoning = event.get("reasoning")
+
+            tool_calls: list[ToolCall] = []
+            observation_results: list[ObservationResult] = []
+            for tc in event.get("tool_calls", []):
+                call_id = tc.get("call_id", "")
+                arguments = tc.get("arguments") or {}
+                if not isinstance(arguments, dict):
+                    arguments = {"value": arguments}
+
+                tool_calls.append(
+                    ToolCall(
+                        tool_call_id=call_id,
+                        function_name=tc.get("tool_name", ""),
+                        arguments=arguments,
+                    )
+                )
+                observation_results.append(
+                    ObservationResult(
+                        source_call_id=call_id or None,
+                        content=tc.get("output"),
+                    )
+                )
+
+            extra: dict[str, Any] | None = None
+            api_call_id = event.get("api_call_id")
+            if api_call_id:
+                extra = {"api_call_id": api_call_id}
+            codex_turn_id = event.get("codex_turn_id")
+            if codex_turn_id:
+                extra = extra or {}
+                extra["codex_turn_id"] = codex_turn_id
+
+            tool_details: dict[str, Any] = {}
+            for tc in event.get("tool_calls", []):
+                call_id = tc.get("call_id", "")
+                details: dict[str, Any] = {}
+                for source_key, target_key in (
+                    ("metadata", "metadata"),
+                    ("raw_arguments", "raw_arguments"),
+                    ("status", "status"),
+                ):
+                    value = tc.get(source_key)
+                    if value:
+                        details[target_key] = value
+                if details:
+                    tool_details[call_id] = details
+            if tool_details:
+                extra = extra or {}
+                extra["tool_call_details"] = tool_details
+
+            observation = (
+                Observation(results=observation_results)
+                if observation_results
+                else None
+            )
+
+            return Step(
+                step_id=step_id,
+                timestamp=event.get("timestamp"),
+                source="agent",
+                message=text,
+                model_name=self.model_name if self.model_name else None,
+                reasoning_content=reasoning if reasoning else None,
+                tool_calls=tool_calls or None,
+                observation=observation,
+                metrics=Metrics(**event["metrics"]) if event.get("metrics") else None,
+                llm_call_count=1,
                 extra=extra,
             )
 
@@ -420,24 +671,72 @@ class Codex(BaseInstalledAgent):
         normalized_events: list[dict[str, Any]] = []
         pending_calls: dict[str, dict[str, Any]] = {}
         pending_reasoning: str | None = None
+        codex_turn_id: str | None = None
+        api_call_index = 1
+        current_api_call_id = f"api_call_{api_call_index}"
+        api_call_metrics: dict[str, dict[str, Any]] = {}
+        saw_model_output_in_api_call = False
+        tool_order_counter = 0
+
+        def record_model_output() -> None:
+            nonlocal saw_model_output_in_api_call
+            saw_model_output_in_api_call = True
+
+        def finish_api_call(token_count_payload: dict[str, Any]) -> None:
+            nonlocal api_call_index, current_api_call_id, saw_model_output_in_api_call
+            nonlocal tool_order_counter
+
+            if not saw_model_output_in_api_call:
+                return
+
+            metrics = self._metrics_from_token_count_payload(token_count_payload)
+            if metrics:
+                api_call_metrics[current_api_call_id] = metrics
+
+            api_call_index += 1
+            current_api_call_id = f"api_call_{api_call_index}"
+            saw_model_output_in_api_call = False
+            tool_order_counter = 0
 
         for event in raw_events:
             etype = event.get("type")
             payload = event.get("payload", {})
             timestamp = event.get("timestamp")
 
+            if etype == "event_msg" and isinstance(payload, dict):
+                event_type = payload.get("type")
+                if event_type in {"task_started", "turn_started"}:
+                    turn_id = payload.get("turn_id")
+                    codex_turn_id = turn_id if isinstance(turn_id, str) else None
+                elif event_type in {"task_complete", "turn_complete", "turn_aborted"}:
+                    codex_turn_id = None
+                elif event_type == "token_count":
+                    finish_api_call(payload)
+                continue
+
+            if etype == "turn_context":
+                turn_id = payload.get("turn_id") if isinstance(payload, dict) else None
+                if isinstance(turn_id, str) and codex_turn_id is None:
+                    codex_turn_id = turn_id
+                continue
+
             if etype != "response_item":
-                if etype == "event_msg":
-                    # token counts handled later for metrics
-                    continue
                 continue
 
             payload_type = payload.get("type")
             if payload_type == "reasoning":
                 summary = payload.get("summary")
                 if isinstance(summary, list) and summary:
-                    pending_reasoning = "\n".join(
-                        str(item) for item in summary if isinstance(item, str)
+                    reasoning_parts: list[str] = []
+                    for item in summary:
+                        if isinstance(item, str):
+                            reasoning_parts.append(item)
+                        elif isinstance(item, dict):
+                            text = item.get("text")
+                            if isinstance(text, str):
+                                reasoning_parts.append(text)
+                    pending_reasoning = (
+                        "\n".join(reasoning_parts) if reasoning_parts else None
                     )
                 else:
                     pending_reasoning = None
@@ -453,6 +752,8 @@ class Codex(BaseInstalledAgent):
                 normalized_events.append(
                     {
                         "kind": "message",
+                        "api_call_id": current_api_call_id,
+                        "codex_turn_id": codex_turn_id,
                         "timestamp": timestamp,
                         "role": payload.get("role", "user"),
                         "text": text,
@@ -461,6 +762,8 @@ class Codex(BaseInstalledAgent):
                         else None,
                     }
                 )
+                if payload.get("role") == "assistant":
+                    record_model_output()
                 pending_reasoning = None
                 continue
 
@@ -478,6 +781,9 @@ class Codex(BaseInstalledAgent):
                 normalized_events.append(
                     {
                         "kind": "tool_call",
+                        "api_call_id": current_api_call_id,
+                        "codex_turn_id": codex_turn_id,
+                        "tool_order": tool_order_counter,
                         "timestamp": timestamp,
                         "call_id": "",
                         "tool_name": "web_search_call",
@@ -488,6 +794,8 @@ class Codex(BaseInstalledAgent):
                         "message": None,
                     }
                 )
+                tool_order_counter += 1
+                record_model_output()
                 pending_reasoning = None
                 continue
 
@@ -512,6 +820,9 @@ class Codex(BaseInstalledAgent):
 
                 pending_calls[call_id] = {
                     "kind": "tool_call",
+                    "api_call_id": current_api_call_id,
+                    "codex_turn_id": codex_turn_id,
+                    "tool_order": tool_order_counter,
                     "timestamp": timestamp,
                     "call_id": call_id,
                     "tool_name": payload.get("name") or "",
@@ -521,6 +832,8 @@ class Codex(BaseInstalledAgent):
                     "status": payload.get("status"),
                     "message": None,
                 }
+                tool_order_counter += 1
+                record_model_output()
                 pending_reasoning = None
                 continue
 
@@ -533,6 +846,9 @@ class Codex(BaseInstalledAgent):
                 if call_info is None:
                     call_info = {
                         "kind": "tool_call",
+                        "api_call_id": current_api_call_id,
+                        "codex_turn_id": codex_turn_id,
+                        "tool_order": tool_order_counter,
                         "timestamp": timestamp,
                         "call_id": call_id or "",
                         "tool_name": payload.get("name", "") or "",
@@ -542,6 +858,7 @@ class Codex(BaseInstalledAgent):
                         "status": None,
                         "message": None,
                     }
+                    tool_order_counter += 1
 
                 call_info["output"] = output_text
                 call_info["metadata"] = metadata
@@ -550,8 +867,15 @@ class Codex(BaseInstalledAgent):
                 pending_reasoning = None
                 continue
 
+        for event in normalized_events:
+            api_call_id = event.get("api_call_id")
+            if isinstance(api_call_id, str) and api_call_id in api_call_metrics:
+                event["metrics"] = api_call_metrics[api_call_id]
+
+        grouped_events = self._group_events_by_api_call_id(normalized_events)
+
         steps: list[Step] = []
-        for idx, norm_event in enumerate(normalized_events, start=1):
+        for idx, norm_event in enumerate(grouped_events, start=1):
             try:
                 step = self._convert_event_to_step(norm_event, idx)
             except ValueError as exc:
@@ -567,6 +891,10 @@ class Codex(BaseInstalledAgent):
         if not steps:
             self.logger.debug("No valid steps produced from Codex session")
             return None
+
+        peak_context_tokens, summarization_count = self._extract_context_metrics(
+            raw_events
+        )
 
         # Extract final metrics from the last token_count event with totals
         total_metrics: FinalMetrics | None = None
@@ -601,22 +929,31 @@ class Codex(BaseInstalledAgent):
                     cached_tokens=cached_tokens,
                 )
 
+            final_extra = {
+                "reasoning_output_tokens": reasoning_tokens,
+                "total_tokens": overall_tokens,
+                "last_token_usage": info.get("last_token_usage"),
+            }
+            if summarization_count:
+                final_extra["compacted"] = True
+            final_extra = extra_with_context_metrics(
+                final_extra,
+                peak_context_tokens=peak_context_tokens,
+                summarization_count=summarization_count,
+            )
+
             total_metrics = FinalMetrics(
                 total_prompt_tokens=prompt_tokens if prompt_tokens else None,
                 total_completion_tokens=completion_tokens or None,
                 total_cached_tokens=cached_tokens or None,
                 total_cost_usd=total_cost_usd,
                 total_steps=len(steps),
-                extra={
-                    "reasoning_output_tokens": reasoning_tokens,
-                    "total_tokens": overall_tokens,
-                    "last_token_usage": info.get("last_token_usage"),
-                },
+                extra=final_extra,
             )
             break
 
         trajectory = Trajectory(
-            schema_version="ATIF-v1.5",
+            schema_version="ATIF-v1.7",
             session_id=session_id,
             agent=Agent(
                 name="codex",
@@ -663,11 +1000,7 @@ class Codex(BaseInstalledAgent):
             )
 
         if trajectory.final_metrics:
-            metrics = trajectory.final_metrics
-            context.cost_usd = metrics.total_cost_usd
-            context.n_input_tokens = metrics.total_prompt_tokens or 0
-            context.n_cache_tokens = metrics.total_cached_tokens or 0
-            context.n_output_tokens = metrics.total_completion_tokens or 0
+            populate_context_from_final_metrics(context, trajectory.final_metrics)
 
     def _build_register_skills_command(self) -> str | None:
         """Return a shell command that copies skills to Codex's skills directory."""
