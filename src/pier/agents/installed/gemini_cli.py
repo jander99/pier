@@ -9,10 +9,12 @@ from pier.agents.installed.base import (
     CliFlag,
     with_prompt_template,
 )
+from pier.agents.network import allowlist_from_urls
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.context import AgentContext
 from pier.models.agent.install import AgentInstallSpec, InstallStep
 from pier.models.agent.name import AgentName
+from pier.models.agent.network import NetworkAllowlist
 from pier.models.trajectories import (
     Agent,
     ContentPart,
@@ -137,6 +139,13 @@ class GeminiCli(BaseInstalledAgent):
             ],
             verification_command=self.get_version_command(),
         )
+
+    def network_allowlist(self) -> NetworkAllowlist:
+        urls = [
+            self._get_env("GOOGLE_GEMINI_BASE_URL"),
+            self._get_env("GEMINI_API_BASE"),
+        ]
+        return allowlist_from_urls(urls, default_domains=[".googleapis.com"])
 
     def _save_image(
         self,

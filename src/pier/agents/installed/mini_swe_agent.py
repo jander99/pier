@@ -5,16 +5,20 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+import yaml
+
 from pier.agents.installed.base import (
     BaseInstalledAgent,
     with_prompt_template,
     CliFlag,
 )
+from pier.agents.network import allowlist_from_urls, collect_url_values
 from pier.agents.utils import get_api_key_var_names_from_model_name
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.context import AgentContext
 from pier.models.agent.install import AgentInstallSpec, InstallStep
 from pier.models.agent.name import AgentName
+from pier.models.agent.network import NetworkAllowlist
 from pier.models.trajectories import (
     Agent,
     FinalMetrics,
@@ -340,6 +344,23 @@ class MiniSweAgent(BaseInstalledAgent):
             default="0",
         ),
     ]
+    _LITELLM_MODEL_COST_MAP_URL = (
+        "https://raw.githubusercontent.com/BerriAI/litellm/main/"
+        "model_prices_and_context_window.json"
+    )
+    _DEFAULT_PROVIDER_DOMAINS: dict[str, list[str]] = {
+        "anthropic": ["api.anthropic.com"],
+        "bedrock": [".amazonaws.com"],
+        "deepseek": ["api.deepseek.com"],
+        "gemini": [".googleapis.com"],
+        "google": [".googleapis.com"],
+        "groq": ["api.groq.com"],
+        "mistral": ["api.mistral.ai"],
+        "openai": ["api.openai.com"],
+        "openrouter": ["openrouter.ai"],
+        "vertex_ai": [".googleapis.com"],
+        "xai": ["api.x.ai"],
+    }
 
     def __init__(
         self,
@@ -386,16 +407,44 @@ class MiniSweAgent(BaseInstalledAgent):
             '  echo "Warning: No known package manager found, assuming build tools are available" >&2;'
             " fi"
         )
-        agent_run = (
-            "set -euo pipefail; "
-            "curl -LsSf https://astral.sh/uv/0.7.13/install.sh | sh && "
-            'if ! grep -q \'export PATH="$HOME/.local/bin:$PATH"\' "$HOME/.bashrc" 2>/dev/null; then'
-            '  echo \'export PATH="$HOME/.local/bin:$PATH"\' >> "$HOME/.bashrc";'
-            " fi && "
-            'source "$HOME/.local/bin/env" && '
-            f"uv tool install mini-swe-agent{version_spec} && "
-            "mini-swe-agent --help"
+        agent_run = f"""
+set -euo pipefail
+curl -LsSf https://astral.sh/uv/0.7.13/install.sh | sh
+if ! grep -q 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.bashrc" 2>/dev/null; then
+  echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
+fi
+source "$HOME/.local/bin/env"
+uv tool install mini-swe-agent{version_spec}
+
+python_bin="$(head -n 1 "$(command -v mini-swe-agent)" | sed 's/^#!//')"
+"$python_bin" <<'PY'
+import json
+import sys
+import urllib.request
+from importlib.resources import files
+
+url = "{self._LITELLM_MODEL_COST_MAP_URL}"
+path = files("litellm").joinpath("model_prices_and_context_window_backup.json")
+
+try:
+    with urllib.request.urlopen(url, timeout=20) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    if not isinstance(data, dict) or len(data) < 1000:
+        raise ValueError(
+            "unexpected LiteLLM model cost map shape: "
+            f"{{type(data).__name__}}, "
+            f"{{len(data) if isinstance(data, dict) else 'n/a'}} entries"
         )
+    path.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+except Exception as exc:
+    print(
+        f"Warning: failed to refresh LiteLLM model cost map backup: {{exc}}",
+        file=sys.stderr,
+    )
+PY
+
+mini-swe-agent --help
+"""
         return AgentInstallSpec(
             agent_name=self.name(),
             version=self._version,
@@ -405,9 +454,41 @@ class MiniSweAgent(BaseInstalledAgent):
                     env={"DEBIAN_FRONTEND": "noninteractive"},
                     run=root_run,
                 ),
-                InstallStep(user="agent", run=agent_run),
+                InstallStep(
+                    user="agent",
+                    env={"LITELLM_LOCAL_MODEL_COST_MAP": "true"},
+                    run=agent_run,
+                ),
             ],
             verification_command=self.get_version_command(),
+        )
+
+    def network_allowlist(self) -> NetworkAllowlist:
+        urls: list[str] = []
+        for key in (
+            "OPENAI_BASE_URL",
+            "OPENAI_API_BASE",
+            "ANTHROPIC_BASE_URL",
+            "GEMINI_API_BASE",
+            "OPENROUTER_API_BASE",
+        ):
+            if value := self._get_env(key):
+                urls.append(value)
+
+        if self._config_yaml:
+            try:
+                parsed = yaml.safe_load(self._config_yaml) or {}
+            except yaml.YAMLError:
+                parsed = {}
+            urls.extend(collect_url_values(parsed))
+
+        provider = None
+        if self.model_name and "/" in self.model_name:
+            provider = self.model_name.split("/", 1)[0]
+
+        return allowlist_from_urls(
+            urls,
+            default_domains=self._DEFAULT_PROVIDER_DOMAINS.get(provider or "", []),
         )
 
     @property
@@ -493,6 +574,7 @@ class MiniSweAgent(BaseInstalledAgent):
 
         env = self.build_process_env(
             {
+                "LITELLM_LOCAL_MODEL_COST_MAP": "true",
                 "MSWEA_CONFIGURED": "true",  # Disable interactive setup
                 "MSWEA_COST_TRACKING": "ignore_errors",  # Ignore unknown model costs
             }

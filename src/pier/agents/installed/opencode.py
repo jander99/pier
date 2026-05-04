@@ -9,10 +9,12 @@ from pier.agents.installed.base import (
     CliFlag,
     with_prompt_template,
 )
+from pier.agents.network import allowlist_from_urls, collect_url_values
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.context import AgentContext
 from pier.models.agent.install import AgentInstallSpec, InstallStep
 from pier.models.agent.name import AgentName
+from pier.models.agent.network import NetworkAllowlist
 from pier.models.trajectories import (
     Agent,
     FinalMetrics,
@@ -56,6 +58,16 @@ class OpenCode(BaseInstalledAgent):
     #     experimental:
     #       continue_loop_on_deny: true
     _DEFAULT_CONFIG: dict[str, Any] = {}
+    _DEFAULT_PROVIDER_DOMAINS: dict[str, list[str]] = {
+        "anthropic": ["api.anthropic.com"],
+        "deepseek": ["api.deepseek.com"],
+        "google": [".googleapis.com"],
+        "groq": ["api.groq.com"],
+        "mistral": ["api.mistral.ai"],
+        "openai": ["api.openai.com"],
+        "openrouter": ["openrouter.ai"],
+        "xai": ["api.x.ai"],
+    }
 
     def __init__(self, *args, opencode_config: dict[str, Any] | None = None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -366,9 +378,19 @@ class OpenCode(BaseInstalledAgent):
         The config may include MCP server definitions and/or a provider model
         registration so opencode recognises models not in its built-in registry.
         """
+        config = self._build_runtime_config(include_mcp=True)
+
+        if not config:
+            return None
+
+        config_json = json.dumps(config, indent=2)
+        escaped = shlex.quote(config_json)
+        return f"mkdir -p ~/.config/opencode && echo {escaped} > ~/.config/opencode/opencode.json"
+
+    def _build_runtime_config(self, *, include_mcp: bool) -> dict[str, Any]:
         config: dict[str, Any] = {}
 
-        if self.mcp_servers:
+        if include_mcp and self.mcp_servers:
             mcp: dict[str, dict[str, Any]] = {}
             for server in self.mcp_servers:
                 if server.transport == "stdio":
@@ -392,13 +414,20 @@ class OpenCode(BaseInstalledAgent):
         # Deep-merge preserves sibling keys within nested dicts (e.g. provider, experimental).
         config = self._deep_merge(copy.deepcopy(self._DEFAULT_CONFIG), config)
         config = self._deep_merge(config, self._opencode_config)
+        return config
 
-        if not config:
-            return None
+    def network_allowlist(self) -> NetworkAllowlist:
+        if not self.model_name or "/" not in self.model_name:
+            return NetworkAllowlist()
 
-        config_json = json.dumps(config, indent=2)
-        escaped = shlex.quote(config_json)
-        return f"mkdir -p ~/.config/opencode && echo {escaped} > ~/.config/opencode/opencode.json"
+        provider, _ = self.model_name.split("/", 1)
+        config = self._build_runtime_config(include_mcp=False)
+        provider_config = (config.get("provider") or {}).get(provider) or {}
+        urls = collect_url_values(provider_config)
+        return allowlist_from_urls(
+            urls,
+            default_domains=self._DEFAULT_PROVIDER_DOMAINS.get(provider, []),
+        )
 
     @with_prompt_template
     async def run(

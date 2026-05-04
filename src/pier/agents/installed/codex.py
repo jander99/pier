@@ -3,15 +3,19 @@ import shlex
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
+import toml
+
 from pier.agents.installed.base import (
     BaseInstalledAgent,
     CliFlag,
     with_prompt_template,
 )
+from pier.agents.network import allowlist_from_urls, collect_url_values
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.context import AgentContext
 from pier.models.agent.install import AgentInstallSpec, InstallStep
 from pier.models.agent.name import AgentName
+from pier.models.agent.network import NetworkAllowlist
 from pier.models.trajectories import (
     Agent,
     FinalMetrics,
@@ -86,6 +90,21 @@ class Codex(BaseInstalledAgent):
             if line:
                 return line.removeprefix("codex-cli").strip()
         return text
+
+    def network_allowlist(self) -> NetworkAllowlist:
+        urls: list[str] = []
+        for key in ("OPENAI_BASE_URL", "OPENAI_API_BASE"):
+            if value := self._get_env(key):
+                urls.append(value)
+
+        if self._config_toml:
+            try:
+                parsed = toml.loads(self._config_toml)
+            except toml.TomlDecodeError:
+                parsed = {}
+            urls.extend(collect_url_values(parsed))
+
+        return allowlist_from_urls(urls, default_domains=["api.openai.com"])
 
     def install_spec(self) -> AgentInstallSpec:
         version_spec = f"@{self._version}" if self._version else "@latest"
