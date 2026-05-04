@@ -1528,8 +1528,10 @@ dependencies = [
     { name = "anthropic" },
     { name = "anyio" },
     { name = "claude-agent-sdk" },
+    { name = "fastapi" },
     { name = "harbor" },
     { name = "jinja2" },
+    { name = "litellm" },
     { name = "loguru" },
     { name = "mcp" },
     { name = "modal" },
@@ -1541,6 +1543,7 @@ dependencies = [
     { name = "tenacity" },
     { name = "toml" },
     { name = "typer" },
+    { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
@@ -1553,8 +1556,10 @@ requires-dist = [
     { name = "anthropic", specifier = ">=0.97.0" },
     { name = "anyio", specifier = ">=4.13.0" },
     { name = "claude-agent-sdk", specifier = ">=0.1.17" },
+    { name = "fastapi", specifier = ">=0.128.0" },
     { name = "harbor", specifier = ">=0.5.0" },
     { name = "jinja2", specifier = ">=3.1.0" },
+    { name = "litellm", specifier = ">=1.83.0" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "mcp", specifier = ">=1.27.0" },
     { name = "modal", specifier = ">=1.4.2" },
@@ -1566,6 +1571,7 @@ requires-dist = [
     { name = "tenacity", specifier = ">=9.1.4" },
     { name = "toml", specifier = ">=0.10.2" },
     { name = "typer", specifier = ">=0.12" },
+    { name = "uvicorn", specifier = ">=0.38.0" },
 ]
 
 [package.metadata.requires-dev]
