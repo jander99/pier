@@ -108,6 +108,8 @@ import {
   fetchTasks,
   summarizeJob,
 } from "~/lib/api";
+import { JobScatterChart } from "~/components/job-scatter-chart";
+import { JobSlopeChart } from "~/components/job-slope-chart";
 import { useDebouncedValue, useKeyboardTableNavigation } from "~/lib/hooks";
 import type { JobHeatmapTrialsFilter } from "~/lib/api";
 import type {
@@ -1857,6 +1859,42 @@ export default function Job() {
     placeholderData: keepPreviousData,
   });
 
+  // Cross-Bench + Scatter tabs share the same query: rows = agent+model
+  // configs, columns = datasets, errored trials excluded, unfinished
+  // cells skipped client-side.
+  const {
+    data: slopeData,
+    isLoading: slopeLoading,
+    isPlaceholderData: slopeIsPlaceholder,
+  } = useQuery({
+    queryKey: [
+      "job-slope",
+      jobName,
+      debouncedSearch,
+      agentFilter,
+      providerFilter,
+      modelFilter,
+      sourceFilter,
+      taskFilter,
+    ],
+    queryFn: () =>
+      fetchJobHeatmap(jobName!, {
+        search: debouncedSearch || undefined,
+        agents: agentFilter.length > 0 ? agentFilter : undefined,
+        providers: providerFilter.length > 0 ? providerFilter : undefined,
+        models: modelFilter.length > 0 ? modelFilter : undefined,
+        sources: sourceFilter.length > 0 ? sourceFilter : undefined,
+        tasks: taskFilter.length > 0 ? taskFilter : undefined,
+        rowBy: "config",
+        columnBy: "dataset",
+        trialsFilter: "non_errored",
+      }),
+    enabled:
+      !!jobName && (activeTab === "cross-bench" || activeTab === "scatter"),
+    refetchInterval: job?.finished_at ? false : 5000,
+    placeholderData: keepPreviousData,
+  });
+
   // Handle Escape to navigate back when not on Results tab
   // (Results tab handles Escape via useKeyboardTableNavigation)
   useHotkeys("escape", () => navigate("/"), {
@@ -2056,6 +2094,8 @@ export default function Job() {
           <TabsList className="border-0">
             <TabsTrigger value="results">Results</TabsTrigger>
             <TabsTrigger value="heatmap">Heat Map</TabsTrigger>
+            <TabsTrigger value="cross-bench">Cross-Bench</TabsTrigger>
+            <TabsTrigger value="scatter">Scatter</TabsTrigger>
             <TabsTrigger value="summary">Analysis</TabsTrigger>
           </TabsList>
           <div className="flex items-center gap-3 px-3 text-xs text-muted-foreground">
@@ -2309,6 +2349,62 @@ export default function Job() {
             setStat={setHeatmapStat}
             trialsFilter={heatmapTrialsFilter}
             setTrialsFilter={setHeatmapTrialsFilter}
+          />
+        </TabsContent>
+        <TabsContent value="cross-bench">
+          <div className="grid grid-cols-7 -mb-px">
+            <HeatmapControls
+              searchQuery={searchQuery}
+              setSearchQuery={setSearchQuery}
+              agentOptions={agentOptions}
+              agentFilter={agentFilter}
+              setAgentFilter={setAgentFilter}
+              providerOptions={providerOptions}
+              providerFilter={providerFilter}
+              setProviderFilter={setProviderFilter}
+              modelOptions={modelOptions}
+              modelFilter={modelFilter}
+              setModelFilter={setModelFilter}
+              sourceOptions={sourceOptions}
+              sourceFilter={sourceFilter}
+              setSourceFilter={setSourceFilter}
+              taskOptions={taskOptions}
+              taskFilter={taskFilter}
+              setTaskFilter={setTaskFilter}
+            />
+          </div>
+          <JobSlopeChart
+            data={slopeData}
+            isLoading={slopeLoading}
+            isFetching={slopeIsPlaceholder}
+          />
+        </TabsContent>
+        <TabsContent value="scatter">
+          <div className="grid grid-cols-7 -mb-px">
+            <HeatmapControls
+              searchQuery={searchQuery}
+              setSearchQuery={setSearchQuery}
+              agentOptions={agentOptions}
+              agentFilter={agentFilter}
+              setAgentFilter={setAgentFilter}
+              providerOptions={providerOptions}
+              providerFilter={providerFilter}
+              setProviderFilter={setProviderFilter}
+              modelOptions={modelOptions}
+              modelFilter={modelFilter}
+              setModelFilter={setModelFilter}
+              sourceOptions={sourceOptions}
+              sourceFilter={sourceFilter}
+              setSourceFilter={setSourceFilter}
+              taskOptions={taskOptions}
+              taskFilter={taskFilter}
+              setTaskFilter={setTaskFilter}
+            />
+          </div>
+          <JobScatterChart
+            data={slopeData}
+            isLoading={slopeLoading}
+            isFetching={slopeIsPlaceholder}
           />
         </TabsContent>
         <TabsContent value="summary">

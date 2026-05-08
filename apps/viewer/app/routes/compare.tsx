@@ -14,6 +14,9 @@ import {
 } from "~/components/ui/breadcrumb";
 import { Button } from "~/components/ui/button";
 import { Kbd } from "~/components/ui/kbd";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "~/components/ui/tabs";
+import { JobScatterChart } from "~/components/job-scatter-chart";
+import { JobSlopeChart } from "~/components/job-slope-chart";
 import { fetchComparisonHeatmap, type JobHeatmapTrialsFilter } from "~/lib/api";
 import type { JobHeatmapColumnBy, JobHeatmapRowBy } from "~/lib/types";
 import { HEATMAP_STATS, JobHeatmap, type HeatmapStatKey } from "./job";
@@ -39,8 +42,15 @@ export default function ComparePage() {
     "heatmap_trials",
     parseAsString.withDefault("all")
   );
+  const [tabParam, setTabParam] = useQueryState(
+    "tab",
+    parseAsString.withDefault("heatmap")
+  );
 
   useHotkeys("escape", () => navigate("/"));
+
+  const activeTab =
+    tabParam === "cross-bench" || tabParam === "scatter" ? tabParam : "heatmap";
 
   const heatmapRowValue: JobHeatmapRowBy =
     heatmapRowBy === "agent" || heatmapRowBy === "model" ? heatmapRowBy : "config";
@@ -58,7 +68,12 @@ export default function ComparePage() {
   const setHeatmapTrialsFilter = (value: JobHeatmapTrialsFilter) =>
     setHeatmapTrialsRaw(value === "all" ? null : value);
 
-  const { data, isLoading, error, isPlaceholderData } = useQuery({
+  const {
+    data: heatmapData,
+    isLoading: heatmapLoading,
+    error: heatmapError,
+    isPlaceholderData: heatmapIsPlaceholder,
+  } = useQuery({
     queryKey: [
       "comparison-heatmap",
       jobNames,
@@ -73,7 +88,26 @@ export default function ComparePage() {
         trialsFilter:
           heatmapTrialsFilter === "all" ? undefined : heatmapTrialsFilter,
       }),
-    enabled: jobNames.length >= 1,
+    enabled: jobNames.length >= 1 && activeTab === "heatmap",
+    placeholderData: keepPreviousData,
+  });
+
+  const {
+    data: slopeData,
+    isLoading: slopeLoading,
+    error: slopeError,
+    isPlaceholderData: slopeIsPlaceholder,
+  } = useQuery({
+    queryKey: ["comparison-cross-bench", jobNames],
+    queryFn: () =>
+      fetchComparisonHeatmap(jobNames, {
+        rowBy: "config",
+        columnBy: "dataset",
+        trialsFilter: "non_errored",
+      }),
+    enabled:
+      jobNames.length >= 1 &&
+      (activeTab === "cross-bench" || activeTab === "scatter"),
     placeholderData: keepPreviousData,
   });
 
@@ -115,36 +149,80 @@ export default function ComparePage() {
         </div>
       </div>
 
-      <div className="flex-1 border-t p-4">
-        {error ? (
-          <div className="flex flex-col items-center justify-center h-full gap-4">
-            <p className="text-destructive">
-              Error loading comparison heat map: {error.message}
-            </p>
-            <Button asChild>
-              <Link to="/">
-                <ArrowLeft className="h-4 w-4 mr-2" />
-                Back to Jobs
-              </Link>
-            </Button>
+      <div className="flex-1 border-t">
+        <Tabs
+          value={activeTab}
+          onValueChange={(value) =>
+            setTabParam(value === "heatmap" ? null : value)
+          }
+          className="h-full"
+        >
+          <div className="px-4">
+            <TabsList className="border-0">
+              <TabsTrigger value="heatmap">Heat Map</TabsTrigger>
+              <TabsTrigger value="cross-bench">Cross-Bench</TabsTrigger>
+              <TabsTrigger value="scatter">Scatter</TabsTrigger>
+            </TabsList>
           </div>
-        ) : (
-          <JobHeatmap
-            jobName={jobNames[0]}
-            data={data}
-            isLoading={isLoading}
-            isFetching={isPlaceholderData}
-            rowBy={heatmapRowValue}
-            setRowBy={setHeatmapRowBy}
-            columnBy={heatmapColumnValue}
-            setColumnBy={setHeatmapColumnBy}
-            stat={heatmapStatValue}
-            setStat={setHeatmapStat}
-            trialsFilter={heatmapTrialsFilter}
-            setTrialsFilter={setHeatmapTrialsFilter}
-          />
-        )}
+          <TabsContent value="heatmap" className="mt-0 p-4">
+            {heatmapError ? (
+              <CompareError message={`Error loading comparison heat map: ${heatmapError.message}`} />
+            ) : (
+              <JobHeatmap
+                jobName={jobNames[0]}
+                data={heatmapData}
+                isLoading={heatmapLoading}
+                isFetching={heatmapIsPlaceholder}
+                rowBy={heatmapRowValue}
+                setRowBy={setHeatmapRowBy}
+                columnBy={heatmapColumnValue}
+                setColumnBy={setHeatmapColumnBy}
+                stat={heatmapStatValue}
+                setStat={setHeatmapStat}
+                trialsFilter={heatmapTrialsFilter}
+                setTrialsFilter={setHeatmapTrialsFilter}
+              />
+            )}
+          </TabsContent>
+          <TabsContent value="cross-bench" className="mt-0 p-4">
+            {slopeError ? (
+              <CompareError message={`Error loading cross-bench comparison: ${slopeError.message}`} />
+            ) : (
+              <JobSlopeChart
+                data={slopeData}
+                isLoading={slopeLoading}
+                isFetching={slopeIsPlaceholder}
+                defaultConnectionMode="model"
+              />
+            )}
+          </TabsContent>
+          <TabsContent value="scatter" className="mt-0 p-4">
+            {slopeError ? (
+              <CompareError message={`Error loading scatter comparison: ${slopeError.message}`} />
+            ) : (
+              <JobScatterChart
+                data={slopeData}
+                isLoading={slopeLoading}
+                isFetching={slopeIsPlaceholder}
+              />
+            )}
+          </TabsContent>
+        </Tabs>
       </div>
+    </div>
+  );
+}
+
+function CompareError({ message }: { message: string }) {
+  return (
+    <div className="flex flex-col items-center justify-center h-full gap-4">
+      <p className="text-destructive">{message}</p>
+      <Button asChild>
+        <Link to="/">
+          <ArrowLeft className="h-4 w-4 mr-2" />
+          Back to Jobs
+        </Link>
+      </Button>
     </div>
   );
 }
