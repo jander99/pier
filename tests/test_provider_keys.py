@@ -36,7 +36,7 @@ def test_opencode_minimax_provider_stub_sets_auth(tmp_path: Path):
 
     provider = config["provider"]["minimax"]
     assert provider["npm"] == "@ai-sdk/anthropic"
-    assert provider["options"]["baseURL"] == "https://api.minimax.io/anthropic"
+    assert provider["options"]["baseURL"] == "https://api.minimax.io/anthropic/v1"
     assert provider["options"]["apiKey"] == "{env:MINIMAX_API_KEY}"
 
 
@@ -46,11 +46,11 @@ def test_opencode_minimax_provider_stub_honors_minimax_base_url(
     """MINIMAX_BASE_URL env overrides the default Anthropic-compatible endpoint."""
     from pier.agents.installed.opencode import OpenCode
 
-    monkeypatch.setenv("MINIMAX_BASE_URL", "https://api.minimaxi.com/anthropic")
+    monkeypatch.setenv("MINIMAX_BASE_URL", "https://api.minimaxi.com/anthropic/v1")
     agent = OpenCode(logs_dir=tmp_path, model_name="minimax/MiniMax-M3")
 
     config = agent._build_runtime_config(include_mcp=False)
     assert (
         config["provider"]["minimax"]["options"]["baseURL"]
-        == "https://api.minimaxi.com/anthropic"
+        == "https://api.minimaxi.com/anthropic/v1"
     )

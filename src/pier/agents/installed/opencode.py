@@ -432,8 +432,12 @@ class OpenCode(BaseInstalledAgent):
 
             if provider == "minimax":
                 # Coding Plan subscription keys must use the Anthropic-compatible endpoint.
+                # opencode's @ai-sdk/anthropic provider appends `/messages` directly to the
+                # baseURL origin (no implicit `/v1`), so the baseURL must include `/v1`
+                # to land on MiniMax's `/anthropic/v1/messages` route. Verified via direct
+                # curl: /anthropic/messages returns 404, /anthropic/v1/messages returns 401.
                 # Override MINIMAX_BASE_URL for the China region or a custom endpoint.
-                options["baseURL"] = self._get_env("MINIMAX_BASE_URL") or "https://api.minimax.io/anthropic"
+                options["baseURL"] = self._get_env("MINIMAX_BASE_URL") or "https://api.minimax.io/anthropic/v1"
                 options["apiKey"] = "{env:MINIMAX_API_KEY}"
                 provider_config["npm"] = "@ai-sdk/anthropic"
             elif base_url and provider == "openai":
