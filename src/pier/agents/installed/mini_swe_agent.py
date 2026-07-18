@@ -554,15 +554,6 @@ class MiniSweAgent(BaseInstalledAgent):
     SUPPORTS_ATIF: bool = True
 
     CLI_FLAGS: ClassVar[list[CliFlag]] = []
-    # Per-model default `model_kwargs` to inject when the model is known to
-    # support a litellm parameter and the caller hasn't supplied one. Keys are
-    # the full litellm model name (e.g. "minimax/MiniMax-M3"), values are the
-    # kwargs merged into `self._model_kwargs`. See __init__.
-    _AUTO_THINKING_KWARGS: ClassVar[dict[str, dict[str, Any]]] = {
-        "minimax/MiniMax-M3": {
-            "thinking": {"type": "enabled", "budget_tokens": 10000},
-        },
-    }
     _LITELLM_MODEL_COST_MAP_URL = (
         "https://raw.githubusercontent.com/BerriAI/litellm/main/"
         "model_prices_and_context_window.json"
@@ -600,16 +591,6 @@ class MiniSweAgent(BaseInstalledAgent):
         self._reasoning_effort = reasoning_effort
         self._model_class = model_class
         self._model_kwargs = model_kwargs or {}
-        # Auto-enable litellm's `thinking` object param for models known to
-        # support it. Callers win by passing their own `thinking` entry in
-        # `model_kwargs`. Budget mirrors pier's Claude extended-thinking
-        # precedent in src/pier/analyze/backend.py.
-        if (
-            self.model_name
-            and self.model_name in self._AUTO_THINKING_KWARGS
-            and "thinking" not in self._model_kwargs
-        ):
-            self._model_kwargs.update(self._AUTO_THINKING_KWARGS[self.model_name])
         self._extra_python_packages = extra_python_packages or []
         self._set_cache_control = set_cache_control
         self._config_yaml = config_yaml

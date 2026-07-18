@@ -159,6 +159,4 @@ For Gemini 3 via mini-swe-agent/LiteLLM, omitting `reasoning_effort` uses the Ge
   #     env_key = "MINIMAX_API_KEY"
 ```
 
-On `mini-swe-agent`, thinking is enabled by default for `minimax/MiniMax-M3` via litellm's `thinking` object param (`{"type": "enabled", "budget_tokens": 10000}`). Override per trial with `kwargs: {thinking: {type: enabled, budget_tokens: <N>}}` or disable by setting `thinking: null`.
-
 `gemini-cli` and `cursor-cli` are not supported — their SDKs do not accept a foreign provider URL.
